@@ -1,0 +1,60 @@
+name: 🚨 OpenWrt Official Version Monitor
+
+on:
+  schedule:
+    - cron: '0 22 * * *' # 北京时间每天凌晨 6 点自动运行
+  workflow_dispatch:      # 允许你手动点击测试
+
+jobs:
+  check_version:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write      # 必须有此权限才能触发另一个工作流
+
+    steps:
+      - name: Checkout THIS repository
+        uses: actions/checkout@v4
+
+      - name: Get Latest OpenWrt Release Tag
+        id: get_tag
+        run: |
+          # 只抓取官方标记为 Latest 的稳定版
+          LATEST_TAG=$(curl -s https://api.github.com/repos/openwrt/openwrt/releases/latest | jq -r .tag_name)
+          echo "LATEST_TAG=$LATEST_TAG" >> $GITHUB_OUTPUT
+          
+          LAST_TAG=""
+          [ -f last_openwrt_tag.txt ] && LAST_TAG=$(cat last_openwrt_tag.txt)
+          
+          if [ "$LATEST_TAG" != "$LAST_TAG" ]; then
+            echo "NEW_VERSION_FOUND=true" >> $GITHUB_OUTPUT
+          else
+            echo "NEW_VERSION_FOUND=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Trigger Build Workflow
+        if: steps.get_tag.outputs.NEW_VERSION_FOUND == 'true'
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            // 触发下面的构建工作流，并传入新版本 Tag
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'openwrt-official-build.yml', 
+              ref: context.ref,
+              inputs: { tag: "${{ steps.get_tag.outputs.LATEST_TAG }}" }
+            });
+
+      - name: Update Tag File
+        if: steps.get_tag.outputs.NEW_VERSION_FOUND == 'true'
+        run: |
+          echo "${{ steps.get_tag.outputs.LATEST_TAG }}" > last_openwrt_tag.txt
+
+      - name: Commit Tag Update
+        if: steps.get_tag.outputs.NEW_VERSION_FOUND == 'true'
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: 'CI: Update last known OpenWrt Tag'
+          file_pattern: 'last_openwrt_tag.txt'
