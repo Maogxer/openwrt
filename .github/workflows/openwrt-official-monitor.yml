@@ -5,58 +5,66 @@ on:
     - cron: '0 22 * * *' # 北京时间每天凌晨 6 点自动运行
   push:
     paths:
-      - 'seed.config'     # 🌟 新增：当你修改 seed.config 并推送到 GitHub 时自动运行
-  workflow_dispatch:      # 允许你手动点击测试
+      - 'seed.config'     # 🌟 你修改配置推送到 GitHub 时触发
+  workflow_dispatch:      # 允许手动点击运行
 
 jobs:
-  check_version:
+  check_and_trigger:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      actions: write      # 必须有此权限才能触发另一个工作流
+      actions: write
 
     steps:
       - name: Checkout THIS repository
         uses: actions/checkout@v4
 
-      - name: Get Latest OpenWrt Release Tag
-        id: get_tag
+      - name: Check Version and Determine Action
+        id: check
         run: |
-          # 只抓取官方标记为 Latest 的稳定版
+          # 1. 获取官方最新 Tag
           LATEST_TAG=$(curl -s https://api.github.com/repos/openwrt/openwrt/releases/latest | jq -r .tag_name)
           echo "LATEST_TAG=$LATEST_TAG" >> $GITHUB_OUTPUT
           
+          # 2. 读取本地记录
           LAST_TAG=""
           [ -f last_openwrt_tag.txt ] && LAST_TAG=$(cat last_openwrt_tag.txt)
           
+          # 3. 核心逻辑判断：是否需要启动构建
+          SHOULD_BUILD="false"
+          
           if [ "$LATEST_TAG" != "$LAST_TAG" ]; then
-            echo "NEW_VERSION_FOUND=true" >> $GITHUB_OUTPUT
-          else
-            echo "NEW_VERSION_FOUND=false" >> $GITHUB_OUTPUT
+            echo "原因: 官方发布了新版本 $LATEST_TAG"
+            SHOULD_BUILD="true"
+            echo "UPDATE_LOCAL_FILE=true" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event_name }}" == "push" ] || [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "原因: 手动触发或 seed.config 变动"
+            SHOULD_BUILD="true"
           fi
+          
+          echo "SHOULD_BUILD=$SHOULD_BUILD" >> $GITHUB_OUTPUT
 
       - name: Trigger Build Workflow
-        if: steps.get_tag.outputs.NEW_VERSION_FOUND == 'true'
+        if: steps.check.outputs.SHOULD_BUILD == 'true'
         uses: actions/github-script@v6
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            // 触发下面的构建工作流，并传入新版本 Tag
             await github.rest.actions.createWorkflowDispatch({
               owner: context.repo.owner,
               repo: context.repo.repo,
               workflow_id: 'openwrt-official-build.yml', 
               ref: context.ref,
-              inputs: { tag: "${{ steps.get_tag.outputs.LATEST_TAG }}" }
+              inputs: { tag: "${{ steps.check.outputs.LATEST_TAG }}" }
             });
 
       - name: Update Tag File
-        if: steps.get_tag.outputs.NEW_VERSION_FOUND == 'true'
+        if: steps.check.outputs.UPDATE_LOCAL_FILE == 'true'
         run: |
-          echo "${{ steps.get_tag.outputs.LATEST_TAG }}" > last_openwrt_tag.txt
+          echo "${{ steps.check.outputs.LATEST_TAG }}" > last_openwrt_tag.txt
 
       - name: Commit Tag Update
-        if: steps.get_tag.outputs.NEW_VERSION_FOUND == 'true'
+        if: steps.check.outputs.UPDATE_LOCAL_FILE == 'true'
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: 'CI: Update last known OpenWrt Tag'
