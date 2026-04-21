@@ -3,6 +3,9 @@ name: 🚨 OpenWrt Official Version Monitor
 on:
   schedule:
     - cron: '0 22 * * *' # 北京时间每天凌晨 6 点自动运行
+  push:
+    paths:
+      - 'seed.config'     # 🌟 新增：当你修改 seed.config 并推送到 GitHub 时自动运行
   workflow_dispatch:      # 允许你手动点击测试
 
 jobs:
