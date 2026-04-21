@@ -1,0 +1,72 @@
+name: 🚀 Build OpenWrt Docker for J1900
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'OpenWrt Tag to build'
+        required: true
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout Your Config
+        uses: actions/checkout@v4
+
+      - name: Clone OpenWrt Source
+        uses: actions/checkout@v4
+        with:
+          repository: openwrt/openwrt
+          ref: ${{ github.event.inputs.tag }}
+          path: openwrt-src
+
+      - name: Initialization Environment
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libncurses5-dev gawk git gettext libssl-dev xsltproc wget unzip
+          
+      - name: Update and Install Feeds
+        working-directory: ./openwrt-src
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Generate .config
+        working-directory: ./openwrt-src
+        run: |
+          # 使用你仓库根目录下的 seed.config
+          [ -e ../seed.config ] && cp ../seed.config .config
+          # 核心：必须开启生成的 rootfs.tar.gz 才能做 Docker 镜像
+          echo "CONFIG_TARGET_ROOTFS_TARGZ=y" >> .config
+          make defconfig
+
+      - name: Compile Rootfs
+        working-directory: ./openwrt-src
+        run: |
+          # 利用 GitHub 的多核性能加速
+          make download -j$(nproc)
+          make -j$(nproc) || make -j1 V=s
+          
+      - name: Build and Push Docker Image
+        run: |
+          # 专门定位 x86_64 的产物路径
+          ROOTFS_PATH=$(find openwrt-src/bin/targets/x86/64/ -name "*-rootfs.tar.gz" | head -n 1)
+          cp "$ROOTFS_PATH" openwrt-rootfs.tar.gz
+          
+          # 沿用你成功的 Dockerfile 结构
+          cat <<EOF > Dockerfile
+          FROM scratch
+          ADD openwrt-rootfs.tar.gz /
+          EXPOSE 80 443 22
+          ENTRYPOINT ["/sbin/init"]
+          EOF
+
+          docker login -u ${{ secrets.DOCKER_USERNAME }} -p ${{ secrets.DOCKER_PASSWORD }}
+          REPO=${{ secrets.DOCKER_USERNAME }}/farm-gw-official # 你可以改成你喜欢的名字
+          TAG=${{ github.event.inputs.tag }}
+          
+          # 直接构建并推送 x86 镜像
+          docker build -t $REPO:$TAG -t $REPO:latest .
+          docker push $REPO --all-tags
