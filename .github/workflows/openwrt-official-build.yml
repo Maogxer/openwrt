@@ -1,101 +1,139 @@
-name: 🚀 Build and Push OpenWrt Docker
+name: 🚀 Build Farm-GW (Safe Mode)
 
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'OpenWrt Tag to build'
+        description: 'OpenWrt Tag (from monitor)'
         required: true
         type: string
 
 jobs:
   build:
     runs-on: ubuntu-22.04
-    permissions:
-      contents: write
-
     steps:
-      - name: 📥 Checkout Your Config
+      - name: Checkout Your Config
         uses: actions/checkout@v4
 
-      - name: 📥 Clone OpenWrt Source
+      - name: Clone OpenWrt Source
         uses: actions/checkout@v4
         with:
           repository: openwrt/openwrt
           ref: ${{ github.event.inputs.tag }}
           path: openwrt-src
 
-      - name: 🛠️ Initialization Environment
+      - name: Initialization Environment
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential clang flex bison g++ gawk \
-            gettext git libncurses5-dev libssl-dev python3-distutils rsync \
-            unzip zlib1g-dev file wget
-          sudo timedatectl set-timezone "Asia/Shanghai"
+          sudo apt-get install -y build-essential libncurses5-dev gawk git gettext libssl-dev xsltproc wget unzip
 
-      - name: 🧩 Add OpenClash Feed
+      - name: Add OpenClash Source
         working-directory: ./openwrt-src
         run: |
-          echo "src-git openclash https://github.com/vernesong/OpenClash.git" >> feeds.conf.default
+          mkdir -p package/luci-app-openclash
+          git clone --depth 1 https://github.com/vernesong/OpenClash.git package/luci-app-openclash
+
+      - name: Update and Install Feeds
+        working-directory: ./openwrt-src
+        run: |
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      - name: 🛠️ Fix Rust Build Error (Bypass CI Check)
+      - name: 🛠️ Pre-set Farm Configurations (10.10.10.2)
         working-directory: ./openwrt-src
         run: |
-          # 解决 10_Compile Rootfs.txt 中的 llvm.download-ci-llvm 报错
-          echo "RUST_INSTALL_USE_CI_LLVM=false" >> $GITHUB_ENV
-          find feeds/packages/lang/rust -name "Makefile" -exec sed -i 's/download-ci-llvm = true/download-ci-llvm = "if-unchanged"/g' {} +
-          # 强制在配置中禁用不必要的 Rust 包
-          echo "CONFIG_HAS_RUST=n" >> .config
-          echo "CONFIG_PACKAGE_rust=n" >> .config
+          mkdir -p files/etc/config
+          
+          # 1. 静态网络配置
+          cat <<EOF > files/etc/config/network
+          config interface 'loopback'
+                  option device 'lo'
+                  option proto 'static'
+                  list ipaddr '127.0.0.1/8'
 
-      - name: ⚙️ Load Config & Build Rootfs
+          config globals 'globals'
+                  option dhcp_default_duid '0004f215738d2cea4a63bf93786a0894b598'
+                  option ula_prefix 'fd27:15d:b540::/48'
+
+          config interface 'lan'
+                  option device 'eth0'
+                  option proto 'static'
+                  list ipaddr '10.10.10.2'
+                  option netmask '255.255.255.0'
+                  option gateway '10.10.10.1'
+                  list dns '9.9.9.9'
+                  list dns '149.112.112.112'
+                  list dns '194.242.2.3'
+                  list dns '76.76.2.2'
+                  option ip6assign '60'
+          EOF
+
+          # 2. 关闭 DHCP
+          cat <<EOF > files/etc/config/dhcp
+          config dnsmasq
+                  option domainneeded '1'
+                  option localise_queries '1'
+                  option rebind_protection '1'
+                  option rebind_localhost '1'
+                  option local '/lan/'
+                  option domain 'lan'
+                  option expandhosts '1'
+                  option authoritative '1'
+                  option readethers '1'
+                  option leasefile '/tmp/dhcp.leases'
+                  option resolvfile '/tmp/resolv.conf.d/resolv.conf.auto'
+                  option localservice '1'
+
+          config dhcp 'lan'
+                  option interface 'lan'
+                  option ignore '1'
+
+          config odhcpd 'odhcpd'
+                  option maindhcp '0'
+                  option leasefile '/tmp/odhcpd.leases'
+          EOF
+
+          # 3. 密码注入
+          mkdir -p files/etc
+          RAW_PASS="${{ secrets.OPENWRT_PASSWORD }}"
+          [ -z "$RAW_PASS" ] && RAW_PASS="password" 
+          ENCRYPTED_PASS=$(openssl passwd -1 "$RAW_PASS")
+          echo "root:$ENCRYPTED_PASS:18753:0:99999:7:::" > files/etc/shadow
+
+      - name: Generate .config
         working-directory: ./openwrt-src
         run: |
           [ -e ../seed.config ] && cp ../seed.config .config
           echo "CONFIG_TARGET_ROOTFS_TARGZ=y" >> .config
-          echo "CONFIG_PACKAGE_luci-app-openclash=y" >> .config
-          echo "CONFIG_PACKAGE_luci-i18n-openclash-zh-cn=y" >> .config
-          
           make defconfig
-          make download -j$(nproc)
-          # 编译 rootfs
-          make -j$(nproc) || make -j1 V=s
 
-      - name: 🏗️ Prepare Docker Context
+      - name: Compile Rootfs
+        working-directory: ./openwrt-src
         run: |
-          # 寻找生成的 rootfs 文件
-          ROOTFS_PATH=$(find openwrt-src/bin/targets/x86/64/ -name "*-rootfs.tar.gz" | head -n 1)
-          if [ -z "$ROOTFS_PATH" ]; then echo "Rootfs not found!"; exit 1; fi
+          make download -j$(nproc)
+          # 【核心修复】通过 env -u 移除 CI 环境标识，绕过 Rust 的 LLVM 检测
+          env -u GITHUB_ACTIONS -u GITHUB_WORKFLOW -u CI \
+          make -j$(nproc) || make -j1 V=s
+          
+      - name: 📦 Build and Push Docker Image
+        run: |
+          ROOTFS_PATH=$(find openwrt-src/bin/targets/x86/64/ -name "*rootfs.tar.gz" | head -n 1)
+          if [ -z "$ROOTFS_PATH" ]; then
+            echo "❌ Rootfs not found!"
+            exit 1
+          fi
           cp "$ROOTFS_PATH" openwrt-rootfs.tar.gz
           
-          # 创建 Dockerfile
           cat <<EOF > Dockerfile
           FROM scratch
           ADD openwrt-rootfs.tar.gz /
-          EXPOSE 80 443 22
+          EXPOSE 80 443
           ENTRYPOINT ["/sbin/init"]
           EOF
 
-      - name: 🐳 Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
-
-      - name: 🚀 Build and Push Docker Image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          push: true
-          # 这里的镜像名请修改为：用户名/仓库名
-          tags: |
-            ${{ secrets.DOCKER_USERNAME }}/openwrt-farm-gw:${{ github.event.inputs.tag }}
-            ${{ secrets.DOCKER_USERNAME }}/openwrt-farm-gw:latest
-
-      - name: 📤 Upload Artifacts (Backup)
-        uses: actions/upload-artifact@v4
-        with:
-          name: OpenWrt_Rootfs_${{ github.event.inputs.tag }}
-          path: openwrt-rootfs.tar.gz
+          docker login -u ${{ secrets.DOCKER_USERNAME }} -p ${{ secrets.DOCKER_PASSWORD }}
+          REPO=${{ secrets.DOCKER_USERNAME }}/farm-gw-official
+          TAG="${{ github.event.inputs.tag }}-farm-gw"
+          
+          docker build -t $REPO:$TAG -t $REPO:latest .
+          docker push $REPO --all-tags
