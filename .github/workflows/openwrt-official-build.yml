@@ -1,12 +1,12 @@
-name: 🚀 Build OpenWrt Docker for J1900
+name: 🚀 Build Farm-GW with OpenClash
 
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'OpenWrt Tag to build'
+        description: 'OpenWrt Tag (e.g. v23.05.3)'
         required: true
-        type: string
+        default: 'v23.05.3'
 
 jobs:
   build:
@@ -25,37 +25,104 @@ jobs:
       - name: Initialization Environment
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential libncurses5-dev gawk git gettext libssl-dev xsltproc wget unzip
-          
+          sudo apt-get install -y build-essential libncurses5-dev gawk git gettext libssl-dev xsltproc wget unzip sync
+
+      - name: Add OpenClash Source
+        working-directory: ./openwrt-src
+        run: |
+          mkdir -p package/luci-app-openclash
+          git clone --depth 1 https://github.com/vernesong/OpenClash.git package/luci-app-openclash
+
       - name: Update and Install Feeds
         working-directory: ./openwrt-src
         run: |
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
+      - name: 🛠️ Pre-set Configurations (Secrets & Network)
+        working-directory: ./openwrt-src
+        run: |
+          mkdir -p files/etc/config
+          
+          # 1. 预置你的 10.10.10.2 静态网络配置
+          cat <<EOF > files/etc/config/network
+          config interface 'loopback'
+                  option device 'lo'
+                  option proto 'static'
+                  list ipaddr '127.0.0.1/8'
+
+          config globals 'globals'
+                  option dhcp_default_duid '0004f215738d2cea4a63bf93786a0894b598'
+                  option ula_prefix 'fd27:15d:b540::/48'
+
+          config interface 'lan'
+                  option device 'eth0'
+                  option proto 'static'
+                  list ipaddr '10.10.10.2'
+                  option netmask '255.255.255.0'
+                  option gateway '10.10.10.1'
+                  list dns '9.9.9.9'
+                  list dns '149.112.112.112'
+                  list dns '194.242.2.3'
+                  list dns '76.76.2.2'
+                  option ip6assign '60'
+          EOF
+
+          # 2. 预置强制关闭 DHCP 的配置
+          cat <<EOF > files/etc/config/dhcp
+          config dnsmasq
+                  option domainneeded '1'
+                  option localise_queries '1'
+                  option rebind_protection '1'
+                  option rebind_localhost '1'
+                  option local '/lan/'
+                  option domain 'lan'
+                  option expandhosts '1'
+                  option authoritative '1'
+                  option readethers '1'
+                  option leasefile '/tmp/dhcp.leases'
+                  option resolvfile '/tmp/resolv.conf.d/resolv.conf.auto'
+                  option localservice '1'
+
+          config dhcp 'lan'
+                  option interface 'lan'
+                  option ignore '1'
+
+          config dhcp 'wan'
+                  option interface 'wan'
+                  option ignore '1'
+
+          config odhcpd 'odhcpd'
+                  option maindhcp '0'
+                  option leasefile '/tmp/odhcpd.leases'
+          EOF
+
+          # 3. 动态处理密码 (从 Secrets 读取并生成 shadow 文件)
+          mkdir -p files/etc
+          # 使用 OpenSSL 将明文 Secret 转换为 OpenWrt 兼容的加密哈希
+          RAW_PASS="${{ secrets.OPENWRT_PASSWORD }}"
+          [ -z "$RAW_PASS" ] && RAW_PASS="password" # 备选默认密码
+          ENCRYPTED_PASS=$(openssl passwd -1 "$RAW_PASS")
+          echo "root:$ENCRYPTED_PASS:18753:0:99999:7:::" > files/etc/shadow
+
       - name: Generate .config
         working-directory: ./openwrt-src
         run: |
-          # 使用你仓库根目录下的 seed.config
           [ -e ../seed.config ] && cp ../seed.config .config
-          # 核心：必须开启生成的 rootfs.tar.gz 才能做 Docker 镜像
           echo "CONFIG_TARGET_ROOTFS_TARGZ=y" >> .config
           make defconfig
 
       - name: Compile Rootfs
         working-directory: ./openwrt-src
         run: |
-          # 利用 GitHub 的多核性能加速
           make download -j$(nproc)
           make -j$(nproc) || make -j1 V=s
           
       - name: Build and Push Docker Image
         run: |
-          # 专门定位 x86_64 的产物路径
           ROOTFS_PATH=$(find openwrt-src/bin/targets/x86/64/ -name "*-rootfs.tar.gz" | head -n 1)
           cp "$ROOTFS_PATH" openwrt-rootfs.tar.gz
           
-          # 沿用你成功的 Dockerfile 结构
           cat <<EOF > Dockerfile
           FROM scratch
           ADD openwrt-rootfs.tar.gz /
@@ -64,9 +131,8 @@ jobs:
           EOF
 
           docker login -u ${{ secrets.DOCKER_USERNAME }} -p ${{ secrets.DOCKER_PASSWORD }}
-          REPO=${{ secrets.DOCKER_USERNAME }}/farm-gw-official # 你可以改成你喜欢的名字
+          REPO=${{ secrets.DOCKER_USERNAME }}/farm-gw-official
           TAG=${{ github.event.inputs.tag }}
           
-          # 直接构建并推送 x86 镜像
           docker build -t $REPO:$TAG -t $REPO:latest .
           docker push $REPO --all-tags
