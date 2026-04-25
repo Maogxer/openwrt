@@ -105,7 +105,19 @@ jobs:
         run: |
           [ -e ../seed.config ] && cp ../seed.config .config
           echo "CONFIG_TARGET_ROOTFS_TARGZ=y" >> .config
+
+          # 1. 强力屏蔽 Rust (如果你的固件确实不需要它)
+          echo "CONFIG_HAS_RUST=n" >> .config
+          echo "CONFIG_PACKAGE_rust=n" >> .config
+          echo "CONFIG_PACKAGE_librust=n" >> .config
+          
           make defconfig
+          make download -j$(nproc)
+
+          # 2. 【核心重点】用 env -u 彻底抹除 GitHub 的环境变量痕迹
+          # 这样 Rust 就不知道自己在 CI 环境里了
+          env -u GITHUB_ACTIONS -u GITHUB_WORKFLOW -u CI -u GITHUB_RUN_ID \
+          make -j$(nproc) || make -j1 V=s
 
       - name: Compile Rootfs
         working-directory: ./openwrt-src
