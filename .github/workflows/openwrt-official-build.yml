@@ -1,12 +1,12 @@
-name: 🚀 Build Farm-GW with OpenClash
+name: 🚀 Build Farm-GW (Auto Triggered)
 
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'OpenWrt Tag (e.g. v23.05.3)'
+        description: 'OpenWrt Tag to build (passed from monitor)'
         required: true
-        default: 'v23.05.3'
+        type: string
 
 jobs:
   build:
@@ -25,11 +25,13 @@ jobs:
       - name: Initialization Environment
         run: |
           sudo apt-get update
+          # 移除了不存在的 sync 包，保留核心编译工具
           sudo apt-get install -y build-essential libncurses5-dev gawk git gettext libssl-dev xsltproc wget unzip
 
       - name: Add OpenClash Source
         working-directory: ./openwrt-src
         run: |
+          # 根据 README 建议，直接将 OpenClash 源码拉入 package 目录
           mkdir -p package/luci-app-openclash
           git clone --depth 1 https://github.com/vernesong/OpenClash.git package/luci-app-openclash
 
@@ -39,12 +41,12 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      - name: 🛠️ Pre-set Configurations (Secrets & Network)
+      - name: 🛠️ Pre-set Farm Configurations (Network & Anti-Reset)
         working-directory: ./openwrt-src
         run: |
           mkdir -p files/etc/config
           
-          # 1. 预置你的 10.10.10.2 静态网络配置
+          # 1. 固化 10.10.10.2 静态网络配置（根据你提供的 cat 结果还原）
           cat <<EOF > files/etc/config/network
           config interface 'loopback'
                   option device 'lo'
@@ -97,19 +99,22 @@ jobs:
                   option leasefile '/tmp/odhcpd.leases'
           EOF
 
-          # 3. 动态处理密码 (从 Secrets 读取并生成 shadow 文件)
+          # 3. 动态处理 Root 密码 (从 GitHub Secrets 获取)
           mkdir -p files/etc
-          # 使用 OpenSSL 将明文 Secret 转换为 OpenWrt 兼容的加密哈希
           RAW_PASS="${{ secrets.OPENWRT_PASSWORD }}"
-          [ -z "$RAW_PASS" ] && RAW_PASS="password" # 备选默认密码
+          [ -z "$RAW_PASS" ] && RAW_PASS="password" 
           ENCRYPTED_PASS=$(openssl passwd -1 "$RAW_PASS")
           echo "root:$ENCRYPTED_PASS:18753:0:99999:7:::" > files/etc/shadow
 
       - name: Generate .config
         working-directory: ./openwrt-src
         run: |
+          # 复制你本地的 seed.config
           [ -e ../seed.config ] && cp ../seed.config .config
+          # 确保开启 rootfs 生成
           echo "CONFIG_TARGET_ROOTFS_TARGZ=y" >> .config
+          # 强制勾选 OpenClash 及其依赖
+          echo "CONFIG_PACKAGE_luci-app-openclash=y" >> .config
           make defconfig
 
       - name: Compile Rootfs
@@ -132,7 +137,8 @@ jobs:
 
           docker login -u ${{ secrets.DOCKER_USERNAME }} -p ${{ secrets.DOCKER_PASSWORD }}
           REPO=${{ secrets.DOCKER_USERNAME }}/farm-gw-official
-          TAG=${{ github.event.inputs.tag }}
+          # 镜像标签带上 farm-gw 标识以区分官方版
+          TAG="${{ github.event.inputs.tag }}-farm-gw"
           
           docker build -t $REPO:$TAG -t $REPO:latest .
           docker push $REPO --all-tags
