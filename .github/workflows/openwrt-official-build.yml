@@ -117,6 +117,16 @@ jobs:
           echo "CONFIG_PACKAGE_luci-app-openclash=y" >> .config
           make defconfig
 
+      - name: 🛠️ Fix Rust Build Error
+        working-directory: ./openwrt-src
+        run: |
+          # 修复 Rust 在 CI 环境下的构建配置矛盾
+          if [ -d "feeds/packages/lang/rust" ]; then
+            sed -i 's/download-ci-llvm = true/download-ci-llvm = "if-unchanged"/g' feeds/packages/lang/rust/Makefile || true
+          fi
+          # 另外，既然是在 Docker 里跑，我们可以尽量跳过 host 端的工具编译
+          echo "CONFIG_MAKE_TOOLCHAIN=y" >> .config
+
       - name: Compile Rootfs
         working-directory: ./openwrt-src
         run: |
