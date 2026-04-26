@@ -1,10 +1,10 @@
-name: 🚀 Build Farm-GW (Safe Mode)
+name: 🚀 Build Farm-GW (Final Fixed Version)
 
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'OpenWrt Tag (from monitor)'
+        description: 'OpenWrt Tag'
         required: true
         type: string
 
@@ -25,120 +25,79 @@ jobs:
       - name: Initialization Environment
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential libncurses5-dev gawk git gettext libssl-dev xsltproc wget unzip
+          sudo apt-get install -y build-essential libncurses5-dev gawk git gettext libssl-dev xsltproc wget unzip qemu-utils
 
-      - name: Add OpenClash Source
+      - name: Update Feeds & Add OpenClash
         working-directory: ./openwrt-src
         run: |
-          mkdir -p package/luci-app-openclash
-          git clone --depth 1 https://github.com/vernesong/OpenClash.git package/luci-app-openclash
-
-      - name: Update and Install Feeds
-        working-directory: ./openwrt-src
-        run: |
+          # 将 OpenClash 加入 feed 列表（比直接 clone 到 package 更稳）
+          echo "src-git openclash https://github.com/vernesong/OpenClash.git" >> feeds.conf.default
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      - name: 🛠️ Pre-set Farm Configurations (10.10.10.2)
+      - name: 🛠️ Setup uci-defaults (Network & Password)
         working-directory: ./openwrt-src
         run: |
-          mkdir -p files/etc/config
+          mkdir -p files/etc/uci-defaults
           
-          # 1. 静态网络配置
-          cat <<EOF > files/etc/config/network
-          config interface 'loopback'
-                  option device 'lo'
-                  option proto 'static'
-                  list ipaddr '127.0.0.1/8'
+          # 创建初始化脚本，确保在第一次启动时强制修改 IP 和 密码
+          cat <<EOF > files/etc/uci-defaults/99-farm-setup
+          # 1. 网络配置
+          uci set network.lan.proto='static'
+          uci set network.lan.ipaddr='10.10.10.2'
+          uci set network.lan.netmask='255.255.255.0'
+          uci set network.lan.gateway='10.10.10.1'
+          uci del network.lan.bridge
+          uci set network.lan.device='eth0'
+          uci add_list network.lan.dns='9.9.9.9'
+          uci add_list network.lan.dns='149.112.112.112'
+          uci commit network
 
-          config globals 'globals'
-                  option dhcp_default_duid '0004f215738d2cea4a63bf93786a0894b598'
-                  option ula_prefix 'fd27:15d:b540::/48'
+          # 2. 禁用 DHCP (旁路由模式)
+          uci set dhcp.lan.ignore='1'
+          uci commit dhcp
 
-          config interface 'lan'
-                  option device 'eth0'
-                  option proto 'static'
-                  list ipaddr '10.10.10.2'
-                  option netmask '255.255.255.0'
-                  option gateway '10.10.10.1'
-                  list dns '9.9.9.9'
-                  list dns '149.112.112.112'
-                  list dns '194.242.2.3'
-                  list dns '76.76.2.2'
-                  option ip6assign '60'
-          EOF
-
-          # 2. 关闭 DHCP
-          cat <<EOF > files/etc/config/dhcp
-          config dnsmasq
-                  option domainneeded '1'
-                  option localise_queries '1'
-                  option rebind_protection '1'
-                  option rebind_localhost '1'
-                  option local '/lan/'
-                  option domain 'lan'
-                  option expandhosts '1'
-                  option authoritative '1'
-                  option readethers '1'
-                  option leasefile '/tmp/dhcp.leases'
-                  option resolvfile '/tmp/resolv.conf.d/resolv.conf.auto'
-                  option localservice '1'
-
-          config dhcp 'lan'
-                  option interface 'lan'
-                  option ignore '1'
-
-          config odhcpd 'odhcpd'
-                  option maindhcp '0'
-                  option leasefile '/tmp/odhcpd.leases'
-          EOF
-
-          # 3. 密码注入
-          mkdir -p files/etc
+          # 3. 设置密码
           RAW_PASS="${{ secrets.OPENWRT_PASSWORD }}"
-          [ -z "$RAW_PASS" ] && RAW_PASS="password" 
-          ENCRYPTED_PASS=$(openssl passwd -1 "$RAW_PASS")
-          echo "root:$ENCRYPTED_PASS:18753:0:99999:7:::" > files/etc/shadow
+          [ -z "\$RAW_PASS" ] && RAW_PASS="password"
+          echo "root:\$RAW_PASS" | chpasswd
+          
+          exit 0
+          EOF
+          chmod +x files/etc/uci-defaults/99-farm-setup
 
       - name: Generate .config
         working-directory: ./openwrt-src
         run: |
           [ -e ../seed.config ] && cp ../seed.config .config
-          echo "CONFIG_TARGET_ROOTFS_TARGZ=y" >> .config
-
-          # 1. 强力屏蔽 Rust (如果你的固件确实不需要它)
-          echo "CONFIG_HAS_RUST=n" >> .config
-          echo "CONFIG_PACKAGE_rust=n" >> .config
-          echo "CONFIG_PACKAGE_librust=n" >> .config
+          
+          # 强制确保 OpenClash 及其核心依赖被选中
+          echo "CONFIG_PACKAGE_luci-app-openclash=y" >> .config
+          echo "CONFIG_PACKAGE_luci-i18n-openclash-zh-cn=y" >> .config
+          
+          # 移除可能冲突的包
+          echo "CONFIG_PACKAGE_dnsmasq=n" >> .config
           
           make defconfig
           make download -j$(nproc)
 
-          # 2. 【核心重点】用 env -u 彻底抹除 GitHub 的环境变量痕迹
-          # 这样 Rust 就不知道自己在 CI 环境里了
+      - name: Compile
+        working-directory: ./openwrt-src
+        run: |
+          # 针对 Rust 和 CI 环境的特殊处理
           env -u GITHUB_ACTIONS -u GITHUB_WORKFLOW -u CI -u GITHUB_RUN_ID \
           make -j$(nproc) || make -j1 V=s
 
-      - name: Compile Rootfs
-        working-directory: ./openwrt-src
-        run: |
-          make download -j$(nproc)
-          # 【核心修复】通过 env -u 移除 CI 环境标识，绕过 Rust 的 LLVM 检测
-          env -u GITHUB_ACTIONS -u GITHUB_WORKFLOW -u CI \
-          make -j$(nproc) || make -j1 V=s
-          
       - name: 📦 Build and Push Docker Image
         run: |
           ROOTFS_PATH=$(find openwrt-src/bin/targets/x86/64/ -name "*rootfs.tar.gz" | head -n 1)
-          if [ -z "$ROOTFS_PATH" ]; then
-            echo "❌ Rootfs not found!"
-            exit 1
-          fi
           cp "$ROOTFS_PATH" openwrt-rootfs.tar.gz
           
           cat <<EOF > Dockerfile
           FROM scratch
           ADD openwrt-rootfs.tar.gz /
+          # Docker 环境下 rootfs 可能不触发 uci-defaults，我们手动补一下执行权限
+          RUN chmod +x /etc/uci-defaults/99-farm-setup
           EXPOSE 80 443
           ENTRYPOINT ["/sbin/init"]
           EOF
@@ -146,6 +105,5 @@ jobs:
           docker login -u ${{ secrets.DOCKER_USERNAME }} -p ${{ secrets.DOCKER_PASSWORD }}
           REPO=${{ secrets.DOCKER_USERNAME }}/farm-gw-official
           TAG="${{ github.event.inputs.tag }}-farm-gw"
-          
           docker build -t $REPO:$TAG -t $REPO:latest .
           docker push $REPO --all-tags
